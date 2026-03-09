@@ -13,8 +13,6 @@ import cv2
 import numpy as np
 import numpy.lib.format as fmt
 import yaml
-from numba import njit, prange
-from scipy.ndimage import gaussian_filter1d
 
 from .intervals import TimeInterval
 
@@ -123,8 +121,6 @@ class Interpolator:
             return ScreenInterpolator(root_folder, cache_data, **kwargs)
         elif modality == "time_interval":
             return TimeIntervalInterpolator(root_folder, cache_data, **kwargs)
-        elif modality == "spikes":
-            return SpikeInterpolator(root_folder, cache_data, **kwargs)
         else:
             raise ValueError(
                 f"There is no interpolator for {modality}. Please use 'sequence', 'screen', 'time_interval' as modality or provide a custom interpolator."
@@ -164,6 +160,10 @@ class SequenceInterpolator(Interpolator):
         If True, subtracts mean during normalization.
     normalize_std_threshold : float, optional
         Minimum std threshold to prevent division by near-zero values.
+    neuron_ids : list, optional
+        Biological neuron IDs to include. Converted to indexes using meta/unit_ids.npy.
+    indexes : list, optional
+        Column indexes of neurons to include.
     **kwargs
         Additional keyword arguments (ignored).
 
@@ -193,6 +193,8 @@ class SequenceInterpolator(Interpolator):
         cache_data: bool = False,  # already cached, put it here for consistency
         keep_nans: bool = False,
         interpolation_mode: str = "nearest_neighbor",
+        neuron_ids: list[int] | None = None,
+        indexes: list[int] | None = None,
         normalize: bool = False,
         normalize_subtract_mean: bool = False,
         normalize_std_threshold: typing.Optional[float] = None,  # or 0.01
@@ -202,6 +204,8 @@ class SequenceInterpolator(Interpolator):
         meta = self.load_meta()
         self.keep_nans = keep_nans
         self.interpolation_mode = interpolation_mode
+        self.neuron_ids = neuron_ids
+        self.indexes = indexes
         self.normalize = normalize
         self.normalize_subtract_mean = normalize_subtract_mean
         self.normalize_std_threshold = normalize_std_threshold
@@ -214,6 +218,39 @@ class SequenceInterpolator(Interpolator):
         self.valid_interval = TimeInterval(self.start_time, self.end_time)
 
         self.n_signals = meta["n_signals"]
+        # Convert neuron_ids → column indexes
+        if neuron_ids is not None:
+            unit_ids = np.load(self.root_folder / "meta/unit_ids.npy")
+
+            ids_to_indexes = []
+            for nid in neuron_ids:
+                match = np.where(unit_ids == nid)[0]
+                # raise error if neuron id not found
+                if len(match) == 0:
+                    raise ValueError(f"Neuron id {nid} not found in unit_ids.npy")
+                ids_to_indexes.append(match[0])
+
+        # Validate provided indexes
+        if indexes is not None and len(indexes) > 0:
+            if max(indexes) >= self.n_signals:
+                raise ValueError("indexes contains invalid value")
+
+        # If both neuron_ids and indexes are provided check whether they refer to the same neurons
+        if neuron_ids is not None and indexes is not None:
+            if set(ids_to_indexes) == set(indexes):
+                warnings.warn(
+                    "Both neuron_ids and indexes provided but refer to the same neurons. Using indexes."
+                )
+            else:
+                raise ValueError(
+                    "neuron_ids and indexes refer to different neurons. Provide only one."
+                )
+
+        # If neuron_ids were provided, convert them to indexes
+        if neuron_ids is not None:
+            indexes = ids_to_indexes
+        self.indexes = indexes
+
         # read .mem (memmap) or .npy file
         if self.is_mem_mapped:
             self._data = np.memmap(
@@ -230,6 +267,11 @@ class SequenceInterpolator(Interpolator):
         else:
             self._data = np.load(self.root_folder / "data.npy")
 
+        # Filter selected neurons from data
+        if self.indexes is not None:
+            self._data = self._data[:, self.indexes]
+            self.n_signals = len(self.indexes)
+
         if self.normalize:
             self.normalize_init()
 
@@ -244,6 +286,11 @@ class SequenceInterpolator(Interpolator):
         ), f"std shape does not match: {self.std.shape} vs {self._data.shape}"
         self.mean = self.mean.T
         self.std = self.std.T
+
+        if self.indexes is not None:
+            self.mean = self.mean[:, self.indexes]
+            self.std = self.std[:, self.indexes]
+
         if self.normalize_std_threshold:
             threshold = self.normalize_std_threshold * np.nanmean(self.std)
             idx = self.std > threshold
@@ -899,209 +946,3 @@ class InvalidTrial(ScreenTrial):
     def get_data_(self) -> np.ndarray:
         """Override base implementation to generate blank data"""
         return np.full((1,) + self.image_size, self.interleave_value, dtype=np.float32)
-
-
-#  Numba JIT decorator: compiles Python function to fast machine code at runtime (mainly for numerical loops).
-#  This decorator does not know how to handle self, so it cannot be a member of a class, here SpikeInterpolator.
-# 'parallel=True' allows it to use all CPU cores.
-@njit(parallel=True, fastmath=True)
-def _fast_count_spikes(all_spikes, indices, window_starts, window_ends, out_counts):
-    """
-    all_spikes: 1D array
-    indices: 1D array - start/end of each neuron in all_spikes
-    window_starts: 1D array - start times for the query
-    window_ends: 1D array
-    out_counts: 2D array
-    """
-    n_batch = len(window_starts)
-    n_neurons = len(indices) - 1
-
-    # We parallelize the OUTER loop (the batch).
-    # Or we can parallelize the NEURON loop.
-    # Since N_Neurons (38k) > Batch (e.g. 128), parallelizing neurons is better.
-
-    for i in prange(n_neurons):
-        # 1. Get the slice for this neuron
-        # (This is zero-copy in Numba)
-        idx_start = indices[i]
-        idx_end = indices[i + 1]
-        neuron_spikes = all_spikes[idx_start:idx_end]
-
-        # 2. Check all time windows for this neuron
-        # Since spikes are sorted, we use binary search
-        for b in range(n_batch):
-            t0 = window_starts[b]
-            t1 = window_ends[b]
-
-            # Binary Search
-            # np.searchsorted is supported natively in Numba
-            # It finds where t0 and t1 would fit in the sorted array
-            c_start = np.searchsorted(neuron_spikes, t0)
-            c_end = np.searchsorted(neuron_spikes, t1)
-
-            out_counts[b, i] = c_end - c_start
-
-
-class SpikeInterpolator(Interpolator):
-    """
-    Interpolator for spike train data.
-
-    This interpolator reads raw spike times and computes spike counts within
-    specified time windows around queried timestamps.
-
-    Data Storage Format:
-    --------------------
-    The spike data must be stored in a flat 1D binary file named `spikes.npy` or `spikes.mem`
-    (dtype: float64) inside the `root_folder`.
-
-    The array contains the actual continuous spike timings (e.g., in seconds).
-    The timings must be **blocked by neuron**, and within each neuron's block,
-    the spike times must be **sorted in ascending chronological order**.
-
-    A `meta.yml` file in the same folder must provide a `spike_indices` list.
-    This list defines the start and end indices for each neuron's block in
-    the flat array. For example, if neuron 0 has 50 spikes and neuron 1 has 30
-    spikes, `spike_indices` should be `[0, 50, 80]`.
-
-    Parameters:
-    -----------
-    root_folder : str
-        Path to the directory containing `spikes.npy` and `meta.yml`.
-    cache_data : bool, optional
-        If True, eagerly loads the entire spike array into RAM (`np.load`)
-        for faster access. If False, memory-maps the data from disk (`np.memmap`).
-        Default is False.
-    interpolation_window : float, optional
-        The size of the time window used to count spikes, in the same time units
-        as the spike data. Default is 0.3.
-    interpolation_align : str, optional
-        Alignment of the interpolation window relative to the queried time `t`.
-        - "center": window is [t - window/2, t + window/2)
-        - "left": window is [t, t + window)
-        - "right": window is [t - window, t)
-        Default is "center".
-    smoothing_sigma : float, optional
-        Standard deviation for a Gaussian filter applied to the resulting
-        spike counts along the time axis. The unit is in number of time steps
-        (array indices), not physical time.
-        If your times are 30Hz (33ms) and you want 100ms smoothing,
-        sigma should be ~3.
-        Set to 0.0 to disable smoothing.
-        Default is 0.0.
-    """
-
-    def __init__(
-        self,
-        root_folder: str,
-        cache_data: bool = False,
-        interpolation_window: float = 0.3,
-        interpolation_align: str = "center",
-        smoothing_sigma: float = 0.0,
-    ):
-        super().__init__(root_folder)
-
-        meta = self.load_meta()
-
-        self.start_time = meta["start_time"]
-        self.end_time = meta["end_time"]
-        self.valid_interval = TimeInterval(self.start_time, self.end_time)
-
-        self.interpolation_window = interpolation_window
-        self.interpolation_align = interpolation_align
-        self.smoothing_sigma = smoothing_sigma
-        self.cache_data = cache_data
-        self.is_mem_mapped = meta.get("is_mem_mapped", False)  # read-only memmap
-
-        # Use self.root_folder, defined in the base class
-        filename = "spikes.mem" if self.is_mem_mapped else "spikes.npy"
-        self.dat_path = self.root_folder / filename
-
-        # Ensure indices are typed correctly for Numba
-        self.indices = np.array(meta["spike_indices"]).astype(np.int64)
-        self.n_signals = len(self.indices) - 1
-        meta_n_signals = meta.get("n_signals")
-        if meta_n_signals is not None and meta_n_signals != self.n_signals:
-            raise ValueError(
-                f"Mismatch between meta['n_signals'] ({meta_n_signals}) and "
-                f"len(spike_indices) - 1 ({self.n_signals})."
-            )
-
-        # Check interpolation_align validity
-        if self.interpolation_align not in ["center", "left", "right"]:
-            raise ValueError(
-                f"Unknown alignment mode: {self.interpolation_align}, should be 'center', 'left' or 'right'"
-            )
-
-        # The screen times for our experiment are stored in float64. So this should be the same dtype for consistency and to avoid issues with memmap.
-        # Use the unified cache_data flag for eager loading
-        if self.is_mem_mapped:
-            self.spikes = np.memmap(
-                self.dat_path,
-                dtype=meta.get("dtype", "float64"),
-                mode="r",
-                shape=(self.indices[-1],),
-            )
-            if self.cache_data:
-                self.spikes = np.array(self.spikes)
-        else:
-            self.spikes = np.load(self.dat_path)
-
-    def interpolate(
-        self, times: np.ndarray, return_valid: bool = False
-    ) -> Union[tuple[np.ndarray, np.ndarray], np.ndarray]:
-        # 1. Filter for valid times
-        valid = self.valid_times(times)
-        valid_times = times[valid]
-
-        # Handle edge case where no times are valid
-        if len(valid_times) == 0:
-            return (
-                (np.empty((0, self.n_signals)), valid)
-                if return_valid
-                else np.empty((0, self.n_signals))
-            )
-
-        # 2. Prepare boundaries
-        if self.interpolation_align == "center":
-            starts = valid_times - self.interpolation_window / 2
-            ends = valid_times + self.interpolation_window / 2
-        elif self.interpolation_align == "left":
-            starts = valid_times
-            ends = valid_times + self.interpolation_window
-        elif self.interpolation_align == "right":
-            starts = valid_times - self.interpolation_window
-            ends = valid_times
-        else:
-            raise ValueError(
-                f"Unknown alignment mode: {self.interpolation_align}, should be 'center', 'left' or 'right'"
-            )
-
-        # 3. Prepare Output
-        # valid_size refers to the number of valid timestamps you are querying at once.
-        valid_size = len(valid_times)
-        counts = np.zeros((valid_size, self.n_signals), dtype=np.float64)
-
-        # 4. Call Numba Engine
-        _fast_count_spikes(self.spikes, self.indices, starts, ends, counts)
-
-        # 5. Apply Smoothing (Gaussian Filter)
-        if self.smoothing_sigma > 0:
-            # We assume 'times' is a sorted, equidistant sequence.
-            # If valid_size is 1, smoothing is impossible/no-op.
-            if valid_size > 1:
-                # Apply Gaussian filter along the time axis (axis 0)
-                # Note: sigma is in units of array indices (time steps).
-                # If your times are 30Hz (33ms) and you want 100ms smoothing,
-                # sigma should be ~3.
-                counts = gaussian_filter1d(counts, sigma=self.smoothing_sigma, axis=0)
-
-        return (counts, valid) if return_valid else counts
-
-    def close(self):
-        super().close()
-        # Trigger cleanup of memmap
-        if hasattr(self, "spikes") and isinstance(self.spikes, np.memmap):
-            _mmap_obj = getattr(self.spikes, "_mmap", None)
-            if _mmap_obj is not None:
-                _mmap_obj.close()
-            del self.spikes
